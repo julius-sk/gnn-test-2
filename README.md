@@ -28,7 +28,7 @@ $ conda env create -f environment.yml
 The installation of conda can be found [here](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html).
 
 ## Framework
-![Image text](https://github.com/67526727412/SpLPG/blob/main/SpLPG.png)
+![Image text](https://github.com/xhuang2016/SpLPG/blob/main/SpLPG.png)
 
 
 ## Dataset
