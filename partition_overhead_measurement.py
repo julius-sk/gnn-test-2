@@ -364,7 +364,8 @@ class FastMaxKGNNPartitioningOverhead():
         print(f"\nStep 3: Creating partitioned subgraphs...")
         start_time = time.time()
         
-        def create_subgraph(partition_id):
+        # Create subgraphs sequentially to avoid pickle issues
+        for partition_id in range(self.number_partition):
             # Get nodes in this partition
             partition_nodes = [node for node, p in self.v2p.items() if p == partition_id]
             partition_nodes = torch.tensor(partition_nodes)
@@ -386,15 +387,7 @@ class FastMaxKGNNPartitioningOverhead():
             subgraph_path = os.path.join(self.output_path, f'partition_{partition_id}.bin')
             save_graphs(subgraph_path, [subgraph])
             
-            return partition_id, subgraph.num_nodes(), subgraph.num_edges()
-        
-        # Create subgraphs in parallel
-        with ProcessPoolExecutor(max_workers=min(self.num_workers, self.number_partition)) as executor:
-            futures = [executor.submit(create_subgraph, i) for i in range(self.number_partition)]
-            
-            for future in as_completed(futures):
-                partition_id, num_nodes, num_edges = future.result()
-                print(f"  Partition {partition_id}: {num_nodes:,} nodes, {num_edges:,} edges")
+            print(f"  Partition {partition_id}: {subgraph.num_nodes():,} nodes, {subgraph.num_edges():,} edges")
         
         creation_time = time.time() - start_time
         print(f"Subgraph creation completed in {creation_time:.2f}s")
@@ -454,13 +447,18 @@ class FastMaxKGNNPartitioningOverhead():
 
 
 def run_multiple_experiments_fast():
-    """Run fast experiments on multiple datasets and partition counts."""
+    """Run fast experiments on specified datasets and partition counts."""
     
-    datasets = ['cora', 'citeseer', 'pubmed', 'flickr', 'reddit']  # Start with smaller datasets
-    partition_counts = [2, 4, 8, 16]
+    # Only test the specified datasets and partition counts
+    datasets = ['reddit', 'yelp', 'flickr', 'ogbn-products', 'ogbn-proteins']
+    partition_counts = [4, 8, 16]
     
     all_results = []
     total_start = time.time()
+    
+    print(f"Testing {len(datasets)} datasets with {len(partition_counts)} partition counts each")
+    print(f"Datasets: {', '.join(datasets)}")
+    print(f"Partition counts: {', '.join(map(str, partition_counts))}")
     
     for dataset in datasets:
         print(f"\n{'='*80}")
@@ -472,7 +470,7 @@ def run_multiple_experiments_fast():
                 print(f"\n--- Testing {num_partitions} partitions ---")
                 
                 # Adjust workers and batch size based on dataset size
-                if dataset in ['reddit', 'yelp']:
+                if dataset in ['reddit', 'yelp', 'ogbn-products', 'ogbn-proteins']:
                     num_workers = min(cpu_count(), 8)
                     batch_size = 100000
                 elif dataset in ['flickr']:
@@ -496,10 +494,13 @@ def run_multiple_experiments_fast():
                 results = analyzer.run()
                 all_results.append(results)
                 
-                print(f"✓ {dataset} with {num_partitions} partitions: {results['overhead_ratio']*100:.2f}% overhead")
+                print(f"✓ {dataset} with {num_partitions} partitions: {results['overhead_ratio']*100:.2f}% overhead "
+                      f"(processed in {results['processing_time_seconds']:.1f}s)")
                 
             except Exception as e:
                 print(f"❌ Error processing {dataset} with {num_partitions} partitions: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
     
     # Save combined results
@@ -517,24 +518,44 @@ def run_multiple_experiments_fast():
     print(f"\n{'='*80}")
     print("EXPERIMENT SUMMARY")
     print(f"{'='*80}")
+    print(f"Total experiments: {len(all_results)}/{len(datasets) * len(partition_counts)}")
     print(f"Total time: {total_time:.2f}s")
     print(f"Results saved to: {combined_file}")
     print("\nOverhead by dataset and partition count:")
     
+    # Create a summary table
+    print(f"\n{'Dataset':<15} {'4 Parts':<10} {'8 Parts':<10} {'16 Parts':<10}")
+    print("-" * 50)
+    
+    for dataset in datasets:
+        dataset_results = [r for r in all_results if r['dataset'] == dataset]
+        if dataset_results:
+            row = f"{dataset:<15}"
+            for partition_count in partition_counts:
+                result = next((r for r in dataset_results if r['number_partitions'] == partition_count), None)
+                if result:
+                    row += f" {result['overhead_ratio']*100:>7.2f}%  "
+                else:
+                    row += f" {'ERROR':<9}"
+            print(row)
+    
+    print(f"\nDetailed results:")
     for dataset in datasets:
         dataset_results = [r for r in all_results if r['dataset'] == dataset]
         if dataset_results:
             print(f"\n{dataset}:")
             for result in sorted(dataset_results, key=lambda x: x['number_partitions']):
-                print(f"  {result['number_partitions']} partitions: {result['overhead_ratio']*100:.2f}% "
-                      f"(processed in {result['processing_time_seconds']:.1f}s)")
+                print(f"  {result['number_partitions']} partitions: {result['overhead_ratio']*100:.2f}% overhead, "
+                      f"{result['cut_ratio']*100:.2f}% cut ratio, "
+                      f"processed in {result['processing_time_seconds']:.1f}s")
+        else:
+            print(f"\n{dataset}: No successful results")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Fast MaxK-GNN Graph Partitioning Overhead Analysis')
     parser.add_argument('--dataset', type=str, default='reddit', 
-                       choices=['reddit', 'flickr', 'yelp', 'cora', 'citeseer', 'pubmed', 
-                               'ogbn-arxiv', 'ogbn-products', 'ogbn-proteins'],
+                       choices=['reddit', 'flickr', 'yelp', 'ogbn-products', 'ogbn-proteins'],
                        help='Dataset name')
     parser.add_argument('--data_path', type=str, default='./data/', 
                        help='Path to store/load datasets')
