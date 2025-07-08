@@ -4,7 +4,7 @@ import pandas as pd
 import pickle
 import json
 import csv
-from collections import defaultdict
+from collections import defaultdict, Counter
 import torch
 import dgl
 import sys
@@ -18,6 +18,10 @@ import time
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
 import argparse
+from multiprocessing import Pool, cpu_count
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import threading
+from tqdm import tqdm
 
 # Import MaxK-GNN dataset loaders
 from dgl import AddSelfLoop
@@ -49,8 +53,7 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
             raise ValueError(f"Unknown dataset: {dataset_name}")
         
         g = data[0]
-        # FORCE int64 conversion immediately using correct method
-        g = g.long()  # This is the correct way to convert to int64
+        g = g.long()  # Convert to int64 for METIS
         features = g.ndata["feat"]
         if dataset_name == 'yelp':
             labels = g.ndata["label"].float()
@@ -78,8 +81,7 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
         
         g, labels = data[0]
         labels = torch.squeeze(labels, dim=1)
-        # FORCE int64 conversion immediately using correct method
-        g = g.long()  # This is the correct way to convert to int64
+        g = g.long()  # Convert to int64 for METIS
         features = g.ndata["feat"]
         
         # Convert split indices to masks
@@ -98,8 +100,43 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
         return g, features, labels, (train_mask, valid_mask, test_mask), data.num_classes
 
 
-class MaxKGNNPartitioningOverhead():
-    """Graph Partitioning with Memory Overhead Measurement for MaxK-GNN datasets."""
+def process_edge_batch(args):
+    """Process a batch of edges for partition assignment - optimized for multiprocessing."""
+    edge_batch, v2p = args
+    
+    batch_results = {
+        'internal_edges': 0,
+        'cross_partition_edges': 0,
+        'partition_edge_counts': defaultdict(int),
+        'edge_assignments': defaultdict(set)
+    }
+    
+    for src, dst in edge_batch:
+        src, dst = int(src), int(dst)
+        src_partition = v2p[src]
+        dst_partition = v2p[dst]
+        
+        # Create normalized edge key (smaller node first)
+        edge_key = (min(src, dst), max(src, dst))
+        
+        if src_partition == dst_partition:
+            # Internal edge
+            batch_results['internal_edges'] += 1
+            batch_results['partition_edge_counts'][src_partition] += 1
+            batch_results['edge_assignments'][edge_key].add(src_partition)
+        else:
+            # Cross-partition edge
+            batch_results['cross_partition_edges'] += 1
+            batch_results['partition_edge_counts'][src_partition] += 1
+            batch_results['partition_edge_counts'][dst_partition] += 1
+            batch_results['edge_assignments'][edge_key].add(src_partition)
+            batch_results['edge_assignments'][edge_key].add(dst_partition)
+    
+    return batch_results
+
+
+class FastMaxKGNNPartitioningOverhead():
+    """Fast, multi-threaded graph partitioning overhead measurement for MaxK-GNN datasets."""
 
     def __init__(self, dataset: str = None, 
                  data_path: str = "./data/", 
@@ -107,6 +144,8 @@ class MaxKGNNPartitioningOverhead():
                  number_partition: int = 4, 
                  method: str = 'METIS',
                  selfloop: bool = False,
+                 num_workers: int = None,
+                 batch_size: int = 50000,
                  seed: int = 42):
         super().__init__()
         """Initialization."""
@@ -117,46 +156,19 @@ class MaxKGNNPartitioningOverhead():
         self.number_partition = number_partition
         self.method = method
         self.selfloop = selfloop
+        self.num_workers = num_workers or min(cpu_count(), 8)  # Limit to avoid memory issues
+        self.batch_size = batch_size
         self.seed = seed
         self._set_seed()
         
         # Create output directory
         os.makedirs(self.output_path, exist_ok=True)
         
-        # Load the dataset
-        print(f"Loading dataset: {dataset}")
-        self.g, self.features, self.labels, self.masks, self.num_classes = load_maxkgnn_dataset(
-            dataset, data_path, selfloop
-        )
+        # Set OpenMP threads for METIS
+        os.environ['OMP_NUM_THREADS'] = str(self.num_workers)
         
-        # CRITICAL: Ensure graph is int64 immediately after loading
-        print(f"Original graph dtype: {self.g.idtype}")
-        if self.g.idtype != torch.int64:
-            print("Converting graph to int64...")
-            self.g = self.g.long()
-            print(f"Graph dtype after conversion: {self.g.idtype}")
-        
-        # Add self-loop if specified (ensure int64 compatibility)
-        if selfloop:
-            self.g = dgl.add_self_loop(self.g)
-            # Ensure the graph remains int64 after adding self-loops
-            if self.g.idtype != torch.int64:
-                self.g = self.g.long()
-                print(f"Graph dtype after self-loop: {self.g.idtype}")
-        
-        self.number_edges = self.g.num_edges()
-        self.number_nodes = self.g.num_nodes()
-        
-        # Variables to track memory overhead
-        self.original_edges = self.number_edges
-        self.total_partitioned_edges = 0
-        self.cross_partition_edges = 0
-        self.partition_edge_counts = []
-        
-        print(f"Dataset loaded: {self.number_nodes} nodes, {self.number_edges} edges")
-        print(f"Features shape: {self.features.shape}")
-        print(f"Number of classes: {self.num_classes}")
-        print(f"Graph dtype: {self.g.idtype}")  # Debug info
+        print(f"Using {self.num_workers} workers for parallel processing")
+        print(f"Batch size: {self.batch_size}")
     
     def _set_seed(self):
         """Creating the initial random seed."""
@@ -164,136 +176,158 @@ class MaxKGNNPartitioningOverhead():
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
 
-    def assign_partitions(self):
-        """Partition a graph using METIS or other methods."""
+    def load_dataset_fast(self):
+        """Load dataset with optimizations."""
+        print(f"Loading dataset: {self.dataset}")
+        start_time = time.time()
         
-        # Triple-check graph is int64 for METIS
-        print(f"Graph dtype before METIS: {self.g.idtype}")
+        self.g, self.features, self.labels, self.masks, self.num_classes = load_maxkgnn_dataset(
+            self.dataset, self.data_path, self.selfloop
+        )
+        
+        # Ensure int64 for METIS
         if self.g.idtype != torch.int64:
-            print("CRITICAL: Converting graph to int64 for METIS compatibility...")
+            print("Converting graph to int64...")
             self.g = self.g.long()
-            print(f"Graph dtype after conversion: {self.g.idtype}")
         
-        try:
-            if self.method == 'METIS':
-                print("Calling METIS partitioning...")
-                partitions = dgl.metis_partition_assignment(self.g, 
-                                                            self.number_partition, 
-                                                            balance_edges=True, 
-                                                            mode='k-way', 
-                                                            objtype='cut')
-                print("METIS partitioning completed successfully!")
-            elif self.method == 'Random':
-                partitions = torch.randint(0, self.number_partition, (self.number_nodes,))
-            else:
-                raise ValueError(f"Unknown partitioning method: {self.method}")
-        except Exception as e:
-            print(f"Error during partitioning: {e}")
-            print(f"Graph properties:")
-            print(f"  - Number of nodes: {self.g.num_nodes()}")
-            print(f"  - Number of edges: {self.g.num_edges()}")
-            print(f"  - Node dtype: {self.g.idtype}")
-            print(f"  - Device: {self.g.device}")
-            raise e
+        # Add self-loop if specified
+        if self.selfloop:
+            self.g = dgl.add_self_loop(self.g)
+            if self.g.idtype != torch.int64:
+                self.g = self.g.long()
         
+        self.number_edges = self.g.num_edges()
+        self.number_nodes = self.g.num_nodes()
+        
+        load_time = time.time() - start_time
+        print(f"Dataset loaded in {load_time:.2f}s: {self.number_nodes:,} nodes, {self.number_edges:,} edges")
+        print(f"Features shape: {self.features.shape}")
+        print(f"Number of classes: {self.num_classes}")
+
+    def assign_partitions_fast(self):
+        """Fast partition assignment with proper threading."""
+        print(f"\nStep 1: Assigning partitions using {self.method}...")
+        start_time = time.time()
+        
+        if self.method == 'METIS':
+            print("Calling METIS partitioning (multi-threaded)...")
+            partitions = dgl.metis_partition_assignment(self.g, 
+                                                        self.number_partition, 
+                                                        balance_edges=True, 
+                                                        mode='k-way', 
+                                                        objtype='cut')
+            print("METIS partitioning completed!")
+        elif self.method == 'Random':
+            partitions = torch.randint(0, self.number_partition, (self.number_nodes,))
+        else:
+            raise ValueError(f"Unknown partitioning method: {self.method}")
+        
+        # Convert to dictionary for fast lookup
         self.v2p = {}
-        for i in range(len(partitions)):
-            self.v2p[int(i)] = int(partitions[i])
+        partitions_np = partitions.numpy()
+        for i in range(len(partitions_np)):
+            self.v2p[i] = int(partitions_np[i])
+        
+        partition_time = time.time() - start_time
+        print(f"Partitioning completed in {partition_time:.2f}s")
+        
+        # Print partition balance
+        partition_sizes = np.bincount(partitions_np, minlength=self.number_partition)
+        print("Partition node distribution:")
+        for i, size in enumerate(partition_sizes):
+            print(f"  Partition {i}: {size:,} nodes ({size/self.number_nodes*100:.1f}%)")
         
         # Save partition assignment
         with open(os.path.join(self.output_path, 'partition_assignment.json'), 'w') as f:
             json.dump(self.v2p, f, indent=2)
-        
-        print(f"Partitioned {self.number_nodes} nodes into {self.number_partition} partitions using {self.method}")
-        
-        # Print partition balance
-        partition_sizes = [0] * self.number_partition
-        for node_id, partition_id in self.v2p.items():
-            partition_sizes[partition_id] += 1
-        
-        print("Partition node distribution:")
-        for i, size in enumerate(partition_sizes):
-            print(f"  Partition {i}: {size} nodes ({size/self.number_nodes*100:.1f}%)")
 
-    def measure_partition_overhead(self):
-        """Measure the memory overhead introduced by partitioning."""
+    def measure_partition_overhead_fast(self):
+        """Fast multi-threaded measurement of partition overhead."""
+        print(f"\nStep 2: Measuring partition overhead (parallel processing)...")
+        start_time = time.time()
         
-        print(f"\nOriginal edges: {self.original_edges}")
-        
-        # Get edges from the graph
+        # Get edges as numpy arrays for faster processing
         src_nodes, dst_nodes = self.g.edges()
         src_nodes = src_nodes.numpy()
         dst_nodes = dst_nodes.numpy()
         
-        # Initialize counters
+        print(f"Processing {len(src_nodes):,} edges with {self.num_workers} workers...")
+        
+        # Create edge batches for parallel processing
+        edges = list(zip(src_nodes, dst_nodes))
+        edge_batches = [edges[i:i + self.batch_size] for i in range(0, len(edges), self.batch_size)]
+        
+        print(f"Created {len(edge_batches)} batches of size ~{self.batch_size:,}")
+        
+        # Prepare arguments for multiprocessing
+        batch_args = [(batch, self.v2p) for batch in edge_batches]
+        
+        # Process batches in parallel
+        all_results = []
+        with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+            # Submit all tasks
+            future_to_batch = {executor.submit(process_edge_batch, args): i 
+                             for i, args in enumerate(batch_args)}
+            
+            # Collect results with progress bar
+            with tqdm(total=len(edge_batches), desc="Processing edge batches") as pbar:
+                for future in as_completed(future_to_batch):
+                    batch_idx = future_to_batch[future]
+                    try:
+                        result = future.result()
+                        all_results.append(result)
+                        pbar.update(1)
+                    except Exception as exc:
+                        print(f'Batch {batch_idx} generated an exception: {exc}')
+                        pbar.update(1)
+        
+        # Aggregate results
+        print("Aggregating results...")
+        total_internal = sum(r['internal_edges'] for r in all_results)
+        total_cross = sum(r['cross_partition_edges'] for r in all_results)
+        
+        # Combine partition edge counts
         partition_edges = [0] * self.number_partition
-        cross_partition_count = 0
-        total_edges_stored = 0
+        for result in all_results:
+            for partition_id, count in result['partition_edge_counts'].items():
+                partition_edges[partition_id] += count
         
-        # Track which edges go to which partitions
-        edge_assignments = defaultdict(set)  # edge -> set of partitions
+        # Combine edge assignments for unique edge counting
+        all_edge_assignments = defaultdict(set)
+        for result in all_results:
+            for edge_key, partitions in result['edge_assignments'].items():
+                all_edge_assignments[edge_key].update(partitions)
         
-        # Process each edge
-        for i in range(len(src_nodes)):
-            src = int(src_nodes[i])
-            dst = int(dst_nodes[i])
-            
-            src_partition = self.v2p[src]
-            dst_partition = self.v2p[dst]
-            
-            # Create a normalized edge key (smaller node first)
-            edge_key = (min(src, dst), max(src, dst))
-            
-            # Track which partitions this edge belongs to
-            edge_assignments[edge_key].add(src_partition)
-            if src_partition != dst_partition:
-                edge_assignments[edge_key].add(dst_partition)
-        
-        # Count edges stored in each partition
-        internal_edges = 0
-        cross_edges = 0
-        
-        for edge_key, partitions in edge_assignments.items():
-            num_partitions = len(partitions)
-            if num_partitions == 1:
-                # Internal edge - stored in one partition
-                partition_id = list(partitions)[0]
-                partition_edges[partition_id] += 1
-                internal_edges += 1
-            else:
-                # Cross-partition edge - stored in multiple partitions
-                for partition_id in partitions:
-                    partition_edges[partition_id] += 1
-                cross_edges += 1
-                cross_partition_count += num_partitions  # Count total storage instances
-        
-        # Calculate totals
+        # Calculate final metrics
+        unique_edges = len(all_edge_assignments)
         total_edges_stored = sum(partition_edges)
-        unique_edges = len(edge_assignments)
+        internal_edges = sum(1 for partitions in all_edge_assignments.values() if len(partitions) == 1)
+        cross_edges = unique_edges - internal_edges
+        cross_partition_storage_instances = sum(len(partitions) for partitions in all_edge_assignments.values() if len(partitions) > 1)
         
         # Calculate overhead
         overhead_edges = total_edges_stored - unique_edges
         overhead_ratio = overhead_edges / unique_edges if unique_edges > 0 else 0
+        avg_replication = total_edges_stored / unique_edges if unique_edges > 0 else 0
+        cut_ratio = cross_edges / unique_edges if unique_edges > 0 else 0
+        
+        processing_time = time.time() - start_time
+        print(f"Overhead measurement completed in {processing_time:.2f}s")
         
         print(f"\n=== MEMORY OVERHEAD ANALYSIS ===")
-        print(f"Original unique edges: {unique_edges}")
-        print(f"Total edges stored across partitions: {total_edges_stored}")
-        print(f"Overhead edges (duplications): {overhead_edges}")
+        print(f"Original unique edges: {unique_edges:,}")
+        print(f"Total edges stored across partitions: {total_edges_stored:,}")
+        print(f"Overhead edges (duplications): {overhead_edges:,}")
         print(f"Overhead ratio: {overhead_ratio:.4f} ({overhead_ratio*100:.2f}%)")
         print(f"\nDetailed breakdown:")
-        print(f"- Internal edges (within partition): {internal_edges}")
-        print(f"- Cross-partition edges (unique): {cross_edges}")
-        print(f"- Cross-partition edge storage instances: {cross_partition_count}")
+        print(f"- Internal edges (within partition): {internal_edges:,}")
+        print(f"- Cross-partition edges (unique): {cross_edges:,}")
+        print(f"- Cross-partition storage instances: {cross_partition_storage_instances:,}")
         
         for i in range(self.number_partition):
-            print(f"- Partition {i}: {partition_edges[i]} edges ({partition_edges[i]/total_edges_stored*100:.1f}%)")
+            print(f"- Partition {i}: {partition_edges[i]:,} edges ({partition_edges[i]/total_edges_stored*100:.1f}%)")
         
-        # Calculate replication factor
-        avg_replication = total_edges_stored / unique_edges if unique_edges > 0 else 0
         print(f"- Average edge replication factor: {avg_replication:.4f}")
-        
-        # Calculate cut ratio (fraction of edges that are cross-partition)
-        cut_ratio = cross_edges / unique_edges if unique_edges > 0 else 0
         print(f"- Cut ratio (cross-partition edges / total edges): {cut_ratio:.4f} ({cut_ratio*100:.2f}%)")
         
         # Store results
@@ -306,15 +340,18 @@ class MaxKGNNPartitioningOverhead():
             'dataset': self.dataset,
             'partitioning_method': self.method,
             'number_partitions': self.number_partition,
+            'processing_time_seconds': processing_time,
+            'num_workers': self.num_workers,
+            'batch_size': self.batch_size,
             'original_nodes': self.number_nodes,
-            'original_edges': self.original_edges,
+            'original_edges': self.number_edges,
             'unique_edges': unique_edges,
             'total_partitioned_edges': total_edges_stored,
             'overhead_edges': overhead_edges,
             'overhead_ratio': overhead_ratio,
             'internal_edges': internal_edges,
             'cross_partition_edges': cross_edges,
-            'cross_partition_storage_instances': cross_partition_count,
+            'cross_partition_storage_instances': cross_partition_storage_instances,
             'partition_edge_counts': partition_edges,
             'replication_factor': avg_replication,
             'cut_ratio': cut_ratio,
@@ -322,12 +359,12 @@ class MaxKGNNPartitioningOverhead():
                                           for i in range(self.number_partition)]
         }
 
-    def create_partitioned_subgraphs(self):
-        """Create and save partitioned subgraphs."""
+    def create_partitioned_subgraphs_fast(self):
+        """Create and save partitioned subgraphs efficiently."""
+        print(f"\nStep 3: Creating partitioned subgraphs...")
+        start_time = time.time()
         
-        print("\nCreating partitioned subgraphs...")
-        
-        for partition_id in range(self.number_partition):
+        def create_subgraph(partition_id):
             # Get nodes in this partition
             partition_nodes = [node for node, p in self.v2p.items() if p == partition_id]
             partition_nodes = torch.tensor(partition_nodes)
@@ -349,11 +386,21 @@ class MaxKGNNPartitioningOverhead():
             subgraph_path = os.path.join(self.output_path, f'partition_{partition_id}.bin')
             save_graphs(subgraph_path, [subgraph])
             
-            print(f"  Partition {partition_id}: {subgraph.num_nodes()} nodes, {subgraph.num_edges()} edges")
+            return partition_id, subgraph.num_nodes(), subgraph.num_edges()
+        
+        # Create subgraphs in parallel
+        with ProcessPoolExecutor(max_workers=min(self.num_workers, self.number_partition)) as executor:
+            futures = [executor.submit(create_subgraph, i) for i in range(self.number_partition)]
+            
+            for future in as_completed(futures):
+                partition_id, num_nodes, num_edges = future.result()
+                print(f"  Partition {partition_id}: {num_nodes:,} nodes, {num_edges:,} edges")
+        
+        creation_time = time.time() - start_time
+        print(f"Subgraph creation completed in {creation_time:.2f}s")
 
     def save_overhead_results(self, results):
         """Save overhead measurement results to file."""
-        
         results_file = os.path.join(self.output_path, 'overhead_analysis.json')
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
@@ -369,7 +416,9 @@ class MaxKGNNPartitioningOverhead():
             'overhead_ratio': [results['overhead_ratio']],
             'overhead_percent': [results['overhead_ratio'] * 100],
             'cut_ratio': [results['cut_ratio']],
-            'replication_factor': [results['replication_factor']]
+            'replication_factor': [results['replication_factor']],
+            'processing_time_s': [results['processing_time_seconds']],
+            'num_workers': [results['num_workers']]
         }
         
         df = pd.DataFrame(summary_data)
@@ -380,63 +429,77 @@ class MaxKGNNPartitioningOverhead():
         print(f"  Summary: {summary_file}")
     
     def run(self):
-        """Run the partitioning algorithm with overhead measurement."""
-        print("="*60)
-        print(f"PARTITIONING OVERHEAD ANALYSIS")
+        """Run the fast partitioning algorithm with overhead measurement."""
+        total_start = time.time()
+        
+        print("="*80)
+        print(f"FAST PARTITIONING OVERHEAD ANALYSIS")
         print(f"Dataset: {self.dataset}")
         print(f"Method: {self.method}")
         print(f"Partitions: {self.number_partition}")
-        print("="*60)
+        print(f"Workers: {self.num_workers}")
+        print("="*80)
         
-        print("\nStep 1: Assigning partitions...")
-        self.assign_partitions()
-        
-        print("\nStep 2: Measuring partition overhead...")
-        overhead_results = self.measure_partition_overhead()
-        
-        print("\nStep 3: Creating partitioned subgraphs...")
-        self.create_partitioned_subgraphs()
-        
-        print("\nStep 4: Saving results...")
+        self.load_dataset_fast()
+        self.assign_partitions_fast()
+        overhead_results = self.measure_partition_overhead_fast()
+        self.create_partitioned_subgraphs_fast()
         self.save_overhead_results(overhead_results)
         
-        print('\nPartitioning analysis completed!')
+        total_time = time.time() - total_start
+        print(f'\nTotal analysis completed in {total_time:.2f}s!')
+        print(f"Speedup achieved with {self.num_workers} workers")
+        
         return overhead_results
 
 
-def run_multiple_experiments():
-    """Run experiments on multiple datasets and partition counts."""
+def run_multiple_experiments_fast():
+    """Run fast experiments on multiple datasets and partition counts."""
     
-    datasets = ['reddit', 'flickr', 'yelp', 'cora', 'citeseer', 'pubmed']
+    datasets = ['cora', 'citeseer', 'pubmed', 'flickr', 'reddit']  # Start with smaller datasets
     partition_counts = [2, 4, 8, 16]
     
     all_results = []
+    total_start = time.time()
     
     for dataset in datasets:
-        print(f"\n{'='*60}")
+        print(f"\n{'='*80}")
         print(f"PROCESSING DATASET: {dataset.upper()}")
-        print(f"{'='*60}")
+        print(f"{'='*80}")
         
         for num_partitions in partition_counts:
             try:
                 print(f"\n--- Testing {num_partitions} partitions ---")
                 
-                analyzer = MaxKGNNPartitioningOverhead(
+                # Adjust workers and batch size based on dataset size
+                if dataset in ['reddit', 'yelp']:
+                    num_workers = min(cpu_count(), 8)
+                    batch_size = 100000
+                elif dataset in ['flickr']:
+                    num_workers = min(cpu_count(), 6)
+                    batch_size = 50000
+                else:
+                    num_workers = min(cpu_count(), 4)
+                    batch_size = 20000
+                
+                analyzer = FastMaxKGNNPartitioningOverhead(
                     dataset=dataset,
                     data_path="./data/",
                     output_path=f"./partition_analysis/{dataset}_{num_partitions}partitions/",
                     number_partition=num_partitions,
                     method='METIS',
-                    selfloop=False
+                    selfloop=False,
+                    num_workers=num_workers,
+                    batch_size=batch_size
                 )
                 
                 results = analyzer.run()
                 all_results.append(results)
                 
-                print(f"Overhead for {dataset} with {num_partitions} partitions: {results['overhead_ratio']*100:.2f}%")
+                print(f"✓ {dataset} with {num_partitions} partitions: {results['overhead_ratio']*100:.2f}% overhead")
                 
             except Exception as e:
-                print(f"Error processing {dataset} with {num_partitions} partitions: {e}")
+                print(f"❌ Error processing {dataset} with {num_partitions} partitions: {e}")
                 continue
     
     # Save combined results
@@ -449,9 +512,12 @@ def run_multiple_experiments():
     summary_df = pd.DataFrame(all_results)
     summary_df.to_csv("./partition_analysis/combined_summary.csv", index=False)
     
-    print(f"\n{'='*60}")
+    total_time = time.time() - total_start
+    
+    print(f"\n{'='*80}")
     print("EXPERIMENT SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'='*80}")
+    print(f"Total time: {total_time:.2f}s")
     print(f"Results saved to: {combined_file}")
     print("\nOverhead by dataset and partition count:")
     
@@ -460,11 +526,12 @@ def run_multiple_experiments():
         if dataset_results:
             print(f"\n{dataset}:")
             for result in sorted(dataset_results, key=lambda x: x['number_partitions']):
-                print(f"  {result['number_partitions']} partitions: {result['overhead_ratio']*100:.2f}%")
+                print(f"  {result['number_partitions']} partitions: {result['overhead_ratio']*100:.2f}% "
+                      f"(processed in {result['processing_time_seconds']:.1f}s)")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='MaxK-GNN Graph Partitioning Overhead Analysis')
+    parser = argparse.ArgumentParser(description='Fast MaxK-GNN Graph Partitioning Overhead Analysis')
     parser.add_argument('--dataset', type=str, default='reddit', 
                        choices=['reddit', 'flickr', 'yelp', 'cora', 'citeseer', 'pubmed', 
                                'ogbn-arxiv', 'ogbn-products', 'ogbn-proteins'],
@@ -478,32 +545,40 @@ if __name__ == "__main__":
                        help='Partitioning method')
     parser.add_argument('--selfloop', action='store_true', 
                        help='Add self-loops to the graph')
+    parser.add_argument('--num_workers', type=int, default=None,
+                       help='Number of worker processes (default: auto)')
+    parser.add_argument('--batch_size', type=int, default=50000,
+                       help='Batch size for edge processing')
     parser.add_argument('--run_all', action='store_true',
                        help='Run experiments on all datasets with multiple partition counts')
     
     args = parser.parse_args()
     
     if args.run_all:
-        run_multiple_experiments()
+        run_multiple_experiments_fast()
     else:
-        analyzer = MaxKGNNPartitioningOverhead(
+        analyzer = FastMaxKGNNPartitioningOverhead(
             dataset=args.dataset,
             data_path=args.data_path,
             output_path=f"./partition_analysis/{args.dataset}_{args.number_partition}partitions/",
             number_partition=args.number_partition,
             method=args.method,
-            selfloop=args.selfloop
+            selfloop=args.selfloop,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size
         )
         
         results = analyzer.run()
         
-        print(f"\n{'='*60}")
+        print(f"\n{'='*80}")
         print("FINAL SUMMARY")
-        print(f"{'='*60}")
+        print(f"{'='*80}")
         print(f"Dataset: {args.dataset}")
         print(f"Partitioning method: {args.method}")
         print(f"Number of partitions: {args.number_partition}")
+        print(f"Workers used: {results['num_workers']}")
+        print(f"Processing time: {results['processing_time_seconds']:.2f}s")
         print(f"Memory overhead ratio: {results['overhead_ratio']:.4f} ({results['overhead_ratio']*100:.2f}%)")
         print(f"Cut ratio: {results['cut_ratio']:.4f} ({results['cut_ratio']*100:.2f}%)")
         print(f"Edge replication factor: {results['replication_factor']:.4f}")
-        print(f"\nThis means partitioned data uses {results['overhead_ratio']*100:.2f}% more memory than original data")
+        print(f"\n🚀 This means partitioned data uses {results['overhead_ratio']*100:.2f}% more memory than original data")
