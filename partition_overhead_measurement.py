@@ -49,7 +49,8 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
             raise ValueError(f"Unknown dataset: {dataset_name}")
         
         g = data[0]
-        g = g.long()  # Use int64 instead of int32
+        # FORCE int64 conversion immediately
+        g = g.to(torch.int64)
         features = g.ndata["feat"]
         if dataset_name == 'yelp':
             labels = g.ndata["label"].float()
@@ -77,7 +78,8 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
         
         g, labels = data[0]
         labels = torch.squeeze(labels, dim=1)
-        g = g.long()  # Use int64 instead of int32
+        # FORCE int64 conversion immediately
+        g = g.to(torch.int64)
         features = g.ndata["feat"]
         
         # Convert split indices to masks
@@ -127,11 +129,20 @@ class MaxKGNNPartitioningOverhead():
             dataset, data_path, selfloop
         )
         
+        # CRITICAL: Ensure graph is int64 immediately after loading
+        print(f"Original graph dtype: {self.g.idtype}")
+        if self.g.idtype != torch.int64:
+            print("Converting graph to int64...")
+            self.g = self.g.long()
+            print(f"Graph dtype after conversion: {self.g.idtype}")
+        
         # Add self-loop if specified (ensure int64 compatibility)
         if selfloop:
             self.g = dgl.add_self_loop(self.g)
             # Ensure the graph remains int64 after adding self-loops
-            self.g = self.g.long()
+            if self.g.idtype != torch.int64:
+                self.g = self.g.long()
+                print(f"Graph dtype after self-loop: {self.g.idtype}")
         
         self.number_edges = self.g.num_edges()
         self.number_nodes = self.g.num_nodes()
@@ -156,21 +167,34 @@ class MaxKGNNPartitioningOverhead():
     def assign_partitions(self):
         """Partition a graph using METIS or other methods."""
         
-        # Ensure graph is int64 for METIS
+        # Triple-check graph is int64 for METIS
+        print(f"Graph dtype before METIS: {self.g.idtype}")
         if self.g.idtype != torch.int64:
-            print("Converting graph to int64 for METIS compatibility...")
-            self.g = self.g.long()
+            print("CRITICAL: Converting graph to int64 for METIS compatibility...")
+            self.g = self.g.to(torch.int64)
+            print(f"Graph dtype after conversion: {self.g.idtype}")
         
-        if self.method == 'METIS':
-            partitions = dgl.metis_partition_assignment(self.g, 
-                                                        self.number_partition, 
-                                                        balance_edges=True, 
-                                                        mode='k-way', 
-                                                        objtype='cut')
-        elif self.method == 'Random':
-            partitions = torch.randint(0, self.number_partition, (self.number_nodes,))
-        else:
-            raise ValueError(f"Unknown partitioning method: {self.method}")
+        try:
+            if self.method == 'METIS':
+                print("Calling METIS partitioning...")
+                partitions = dgl.metis_partition_assignment(self.g, 
+                                                            self.number_partition, 
+                                                            balance_edges=True, 
+                                                            mode='k-way', 
+                                                            objtype='cut')
+                print("METIS partitioning completed successfully!")
+            elif self.method == 'Random':
+                partitions = torch.randint(0, self.number_partition, (self.number_nodes,))
+            else:
+                raise ValueError(f"Unknown partitioning method: {self.method}")
+        except Exception as e:
+            print(f"Error during partitioning: {e}")
+            print(f"Graph properties:")
+            print(f"  - Number of nodes: {self.g.num_nodes()}")
+            print(f"  - Number of edges: {self.g.num_edges()}")
+            print(f"  - Node dtype: {self.g.idtype}")
+            print(f"  - Device: {self.g.device}")
+            raise e
         
         self.v2p = {}
         for i in range(len(partitions)):
