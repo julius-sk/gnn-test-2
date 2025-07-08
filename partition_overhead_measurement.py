@@ -49,8 +49,8 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
             raise ValueError(f"Unknown dataset: {dataset_name}")
         
         g = data[0]
-        # FORCE int64 conversion immediately
-        g = g.to(torch.int64)
+        # FORCE int64 conversion immediately using correct method
+        g = g.long()  # This is the correct way to convert to int64
         features = g.ndata["feat"]
         if dataset_name == 'yelp':
             labels = g.ndata["label"].float()
@@ -78,8 +78,8 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
         
         g, labels = data[0]
         labels = torch.squeeze(labels, dim=1)
-        # FORCE int64 conversion immediately
-        g = g.to(torch.int64)
+        # FORCE int64 conversion immediately using correct method
+        g = g.long()  # This is the correct way to convert to int64
         features = g.ndata["feat"]
         
         # Convert split indices to masks
@@ -171,7 +171,7 @@ class MaxKGNNPartitioningOverhead():
         print(f"Graph dtype before METIS: {self.g.idtype}")
         if self.g.idtype != torch.int64:
             print("CRITICAL: Converting graph to int64 for METIS compatibility...")
-            self.g = self.g.to(torch.int64)
+            self.g = self.g.long()
             print(f"Graph dtype after conversion: {self.g.idtype}")
         
         try:
