@@ -10,7 +10,6 @@ import dgl
 import sys
 from dgl.data.utils import save_graphs, load_graphs
 import math
-from utils import create_dgl_graph, pd_reindex_id, read_set
 import random
 np.random.seed(42)
 random.seed(42)
@@ -20,116 +19,178 @@ import warnings
 warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
 import argparse
 
+# Import MaxK-GNN dataset loaders
+from dgl import AddSelfLoop
+from dgl.data import CiteseerGraphDataset, CoraGraphDataset, PubmedGraphDataset
+from dgl.data import RedditDataset, FlickrDataset, YelpDataset
+from ogb.nodeproppred import DglNodePropPredDataset
 
-class PartitioningWithOverheadMeasurement():
-    """Graph Partitioning with Memory Overhead Measurement."""
+
+def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
+    """Load datasets in the same way as MaxK-GNN project."""
+    
+    transform = AddSelfLoop() if selfloop else None
+    
+    if "ogb" not in dataset_name:
+        # Standard DGL datasets
+        if dataset_name == 'reddit':
+            data = RedditDataset(transform=transform, raw_dir=data_path)
+        elif dataset_name == 'flickr':
+            data = FlickrDataset(transform=transform, raw_dir=data_path)
+        elif dataset_name == 'yelp':
+            data = YelpDataset(transform=transform, raw_dir=data_path)
+        elif dataset_name == 'cora':
+            data = CoraGraphDataset(transform=transform, raw_dir=data_path)
+        elif dataset_name == 'citeseer':
+            data = CiteseerGraphDataset(transform=transform, raw_dir=data_path)
+        elif dataset_name == 'pubmed':
+            data = PubmedGraphDataset(transform=transform, raw_dir=data_path)
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}")
+        
+        g = data[0]
+        g = g.int()
+        features = g.ndata["feat"]
+        if dataset_name == 'yelp':
+            labels = g.ndata["label"].float()
+        else:
+            labels = g.ndata["label"]
+        
+        # Get masks
+        if hasattr(g.ndata, 'train_mask'):
+            train_mask = g.ndata["train_mask"].bool()
+            val_mask = g.ndata["val_mask"].bool() 
+            test_mask = g.ndata["test_mask"].bool()
+        else:
+            # Create dummy masks if not available
+            num_nodes = g.num_nodes()
+            train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+            val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+            test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+            
+        return g, features, labels, (train_mask, val_mask, test_mask), data.num_classes
+        
+    else:
+        # OGB datasets
+        data = DglNodePropPredDataset(name=dataset_name, root=data_path)
+        split_idx = data.get_idx_split()
+        
+        g, labels = data[0]
+        labels = torch.squeeze(labels, dim=1)
+        g = g.int()
+        features = g.ndata["feat"]
+        
+        # Convert split indices to masks
+        train_idx = split_idx["train"]
+        valid_idx = split_idx["valid"] 
+        test_idx = split_idx["test"]
+        
+        total_nodes = g.num_nodes()
+        train_mask = torch.zeros(total_nodes, dtype=torch.bool)
+        train_mask[train_idx] = 1
+        valid_mask = torch.zeros(total_nodes, dtype=torch.bool)
+        valid_mask[valid_idx] = 1
+        test_mask = torch.zeros(total_nodes, dtype=torch.bool)
+        test_mask[test_idx] = 1
+        
+        return g, features, labels, (train_mask, valid_mask, test_mask), data.num_classes
+
+
+class MaxKGNNPartitioningOverhead():
+    """Graph Partitioning with Memory Overhead Measurement for MaxK-GNN datasets."""
 
     def __init__(self, dataset: str = None, 
-                 input_path: str = None, 
+                 data_path: str = "./data/", 
                  output_path: str = None, 
                  number_partition: int = 4, 
                  method: str = 'METIS',
+                 selfloop: bool = False,
                  seed: int = 42):
         super().__init__()
         """Initialization."""
         
         self.dataset = dataset
-        self.input_path = input_path
-        self.output_path = output_path
+        self.data_path = data_path
+        self.output_path = output_path or f"./partition_analysis/{dataset}/"
         self.number_partition = number_partition
         self.method = method
+        self.selfloop = selfloop
         self.seed = seed
         self._set_seed()
         
-        isExist = os.path.exists(self.output_path)
-        if not isExist:
-            os.makedirs(self.output_path)
+        # Create output directory
+        os.makedirs(self.output_path, exist_ok=True)
         
-        self.file_name = self.input_path + self.dataset + '/edge_list_linkpred.csv'
-
-        self.g = create_dgl_graph(self.dataset, self.input_path)
-        self.g = dgl.to_bidirected(self.g, copy_ndata=True)
-
+        # Load the dataset
+        print(f"Loading dataset: {dataset}")
+        self.g, self.features, self.labels, self.masks, self.num_classes = load_maxkgnn_dataset(
+            dataset, data_path, selfloop
+        )
+        
+        # Add self-loop if specified
+        if selfloop:
+            self.g = dgl.add_self_loop(self.g)
+        
         self.number_edges = self.g.num_edges()
         self.number_nodes = self.g.num_nodes()
         
         # Variables to track memory overhead
-        self.original_edges = 0
+        self.original_edges = self.number_edges
         self.total_partitioned_edges = 0
         self.cross_partition_edges = 0
         self.partition_edge_counts = []
         
-        print(f"Original graph: {self.number_nodes} nodes, {self.number_edges} edges")
+        print(f"Dataset loaded: {self.number_nodes} nodes, {self.number_edges} edges")
+        print(f"Features shape: {self.features.shape}")
+        print(f"Number of classes: {self.num_classes}")
     
     def _set_seed(self):
         """Creating the initial random seed."""
         random.seed(self.seed)
         np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
 
     def assign_partitions(self):
-        """Partition a graph."""
+        """Partition a graph using METIS or other methods."""
         if self.method == 'METIS':
             partitions = dgl.metis_partition_assignment(self.g, 
                                                         self.number_partition, 
                                                         balance_edges=True, 
                                                         mode='k-way', 
                                                         objtype='cut')
-        elif self.method == 'RandomTMA':
-            partitions = [random.randint(0, self.number_partition - 1) for _ in range(self.g.num_nodes())]
-        elif self.method == 'SuperTMA':
-            self.number_clusters = 1500
-            partitions_metis = dgl.metis_partition_assignment(self.g, 
-                                                            self.number_clusters,
-                                                            balance_edges=False, 
-                                                            mode='k-way',
-                                                            objtype='cut').tolist()
+        elif self.method == 'Random':
+            partitions = torch.randint(0, self.number_partition, (self.number_nodes,))
+        else:
+            raise ValueError(f"Unknown partitioning method: {self.method}")
         
-            rng = np.random.default_rng(seed=self.seed)
-            group_list = []
-            cluster_per_group = float(self.number_clusters) / self.number_partition
-            cluster_list = np.arange(self.number_clusters)
-            rng.shuffle(cluster_list)
-            p = 0
-            for i in range(self.number_partition):
-                group_size = int(np.floor(cluster_per_group))
-                if rng.random() < cluster_per_group % 1:
-                    group_size += 1
-                if i != self.number_partition - 1:
-                    p_end = p + group_size
-                else:
-                    p_end = self.number_clusters
-                group_list.append(cluster_list[p:p_end])
-                p = p_end
-
-            sets_list = []
-            for i in range(self.number_partition):
-                new_set = set()
-                for j in range(len(partitions_metis)):
-                    if partitions_metis[j] in group_list[i]:
-                        new_set.add(j)
-                sets_list.append(new_set)
-
-            max_value = max(max(sublist) for sublist in sets_list)
-            partitions = [0] * (max_value + 1)
-            for index, sublist in enumerate(sets_list):
-                for value in sublist:
-                    partitions[value] = index
-
-        self.v2p = defaultdict(int)
+        self.v2p = {}
         for i in range(len(partitions)):
             self.v2p[int(i)] = int(partitions[i])
         
-        with open(self.output_path + 'partition' + '.json', 'wb') as json_file:
-            pickle.dump(self.v2p, json_file)
+        # Save partition assignment
+        with open(os.path.join(self.output_path, 'partition_assignment.json'), 'w') as f:
+            json.dump(self.v2p, f, indent=2)
+        
+        print(f"Partitioned {self.number_nodes} nodes into {self.number_partition} partitions")
+        
+        # Print partition balance
+        partition_sizes = [0] * self.number_partition
+        for node_id, partition_id in self.v2p.items():
+            partition_sizes[partition_id] += 1
+        
+        print("Partition node distribution:")
+        for i, size in enumerate(partition_sizes):
+            print(f"  Partition {i}: {size} nodes ({size/self.number_nodes*100:.1f}%)")
 
     def measure_partition_overhead(self):
         """Measure the memory overhead introduced by partitioning."""
         
-        # Count original edges (considering bidirectional)
-        edge_list = pd.read_csv(self.file_name, header=None, names=['src', 'dst'])
-        self.original_edges = len(edge_list) * 2  # bidirectional
+        print(f"\nOriginal edges: {self.original_edges}")
         
-        print(f"\nOriginal bidirectional edges: {self.original_edges}")
+        # Get edges from the graph
+        src_nodes, dst_nodes = self.g.edges()
+        src_nodes = src_nodes.numpy()
+        dst_nodes = dst_nodes.numpy()
         
         # Initialize counters
         partition_edges = [0] * self.number_partition
@@ -140,202 +201,276 @@ class PartitioningWithOverheadMeasurement():
         edge_assignments = defaultdict(set)  # edge -> set of partitions
         
         # Process each edge
-        for _, row in edge_list.iterrows():
-            i, j = int(row['src']), int(row['dst'])
+        for i in range(len(src_nodes)):
+            src = int(src_nodes[i])
+            dst = int(dst_nodes[i])
             
-            # For each edge (i,j), add both directions (i,j) and (j,i)
-            edges_to_process = [(i, j), (j, i)]
+            src_partition = self.v2p[src]
+            dst_partition = self.v2p[dst]
             
-            for src, dst in edges_to_process:
-                src_partition = self.v2p[src]
-                dst_partition = self.v2p[dst]
-                
-                edge_key = (min(src, dst), max(src, dst))  # Normalize edge representation
-                
-                if src_partition == dst_partition:
-                    # Edge is within partition
-                    edge_assignments[edge_key].add(src_partition)
-                    partition_edges[src_partition] += 1
-                else:
-                    # Cross-partition edge - needs to be stored in both partitions
-                    edge_assignments[edge_key].add(src_partition)
-                    edge_assignments[edge_key].add(dst_partition)
-                    partition_edges[src_partition] += 1
-                    partition_edges[dst_partition] += 1
-                    cross_partition_count += 1
+            # Create a normalized edge key (smaller node first)
+            edge_key = (min(src, dst), max(src, dst))
+            
+            # Track which partitions this edge belongs to
+            edge_assignments[edge_key].add(src_partition)
+            if src_partition != dst_partition:
+                edge_assignments[edge_key].add(dst_partition)
         
-        # Calculate total edges stored across all partitions
+        # Count edges stored in each partition
+        internal_edges = 0
+        cross_edges = 0
+        
+        for edge_key, partitions in edge_assignments.items():
+            num_partitions = len(partitions)
+            if num_partitions == 1:
+                # Internal edge - stored in one partition
+                partition_id = list(partitions)[0]
+                partition_edges[partition_id] += 1
+                internal_edges += 1
+            else:
+                # Cross-partition edge - stored in multiple partitions
+                for partition_id in partitions:
+                    partition_edges[partition_id] += 1
+                cross_edges += 1
+                cross_partition_count += num_partitions  # Count total storage instances
+        
+        # Calculate totals
         total_edges_stored = sum(partition_edges)
+        unique_edges = len(edge_assignments)
         
         # Calculate overhead
-        overhead_edges = total_edges_stored - self.original_edges
-        overhead_ratio = overhead_edges / self.original_edges if self.original_edges > 0 else 0
-        
-        # Additional analysis
-        cross_partition_edges_unique = sum(1 for edge_partitions in edge_assignments.values() 
-                                         if len(edge_partitions) > 1)
+        overhead_edges = total_edges_stored - unique_edges
+        overhead_ratio = overhead_edges / unique_edges if unique_edges > 0 else 0
         
         print(f"\n=== MEMORY OVERHEAD ANALYSIS ===")
-        print(f"Original edges (bidirectional): {self.original_edges}")
+        print(f"Original unique edges: {unique_edges}")
         print(f"Total edges stored across partitions: {total_edges_stored}")
-        print(f"Overhead edges: {overhead_edges}")
+        print(f"Overhead edges (duplications): {overhead_edges}")
         print(f"Overhead ratio: {overhead_ratio:.4f} ({overhead_ratio*100:.2f}%)")
         print(f"\nDetailed breakdown:")
-        print(f"- Cross-partition edges (unique): {cross_partition_edges_unique}")
-        print(f"- Cross-partition edge instances: {cross_partition_count}")
-        print(f"- Within-partition edges: {total_edges_stored - cross_partition_count}")
+        print(f"- Internal edges (within partition): {internal_edges}")
+        print(f"- Cross-partition edges (unique): {cross_edges}")
+        print(f"- Cross-partition edge storage instances: {cross_partition_count}")
         
         for i in range(self.number_partition):
-            print(f"- Partition {i}: {partition_edges[i]} edges")
+            print(f"- Partition {i}: {partition_edges[i]} edges ({partition_edges[i]/total_edges_stored*100:.1f}%)")
         
         # Calculate replication factor
-        avg_replication = total_edges_stored / (len(edge_assignments) * 2)  # *2 for bidirectional
+        avg_replication = total_edges_stored / unique_edges if unique_edges > 0 else 0
         print(f"- Average edge replication factor: {avg_replication:.4f}")
+        
+        # Calculate cut ratio (fraction of edges that are cross-partition)
+        cut_ratio = cross_edges / unique_edges if unique_edges > 0 else 0
+        print(f"- Cut ratio (cross-partition edges / total edges): {cut_ratio:.4f} ({cut_ratio*100:.2f}%)")
         
         # Store results
         self.partition_edge_counts = partition_edges
         self.total_partitioned_edges = total_edges_stored
-        self.cross_partition_edges = cross_partition_count
+        self.cross_partition_edges = cross_edges
         self.overhead_ratio = overhead_ratio
         
         return {
+            'dataset': self.dataset,
+            'partitioning_method': self.method,
+            'number_partitions': self.number_partition,
+            'original_nodes': self.number_nodes,
             'original_edges': self.original_edges,
+            'unique_edges': unique_edges,
             'total_partitioned_edges': total_edges_stored,
             'overhead_edges': overhead_edges,
             'overhead_ratio': overhead_ratio,
-            'cross_partition_edges': cross_partition_edges_unique,
+            'internal_edges': internal_edges,
+            'cross_partition_edges': cross_edges,
+            'cross_partition_storage_instances': cross_partition_count,
             'partition_edge_counts': partition_edges,
-            'replication_factor': avg_replication
+            'replication_factor': avg_replication,
+            'cut_ratio': cut_ratio,
+            'partition_node_distribution': [sum(1 for p in self.v2p.values() if p == i) 
+                                          for i in range(self.number_partition)]
         }
 
-    def partition_file(self):
-        """Partition the edge list file."""
+    def create_partitioned_subgraphs(self):
+        """Create and save partitioned subgraphs."""
         
-        for i in range(self.number_partition):
-            with open(os.path.join(self.output_path, 'partition_' + str(i) + '.txt'), 'w') as fp:
-                pass
+        print("\nCreating partitioned subgraphs...")
+        
+        for partition_id in range(self.number_partition):
+            # Get nodes in this partition
+            partition_nodes = [node for node, p in self.v2p.items() if p == partition_id]
+            partition_nodes = torch.tensor(partition_nodes)
             
-        self.file = open(self.file_name, 'r')
-        
-        file_objects = []
-        for i in range(self.number_partition):
-            filename = os.path.join(self.output_path, 'partition_' + str(i) + '.txt')
-            files = open(filename, 'a', newline='')
-            file_objects.append(files)
-        
-        reader = csv.reader(self.file, delimiter=',')
-        
-        for _, line in enumerate(reader):
-            i, j = int(line[0]), int(line[1])
-            if self.v2p[i] == self.v2p[j]:
-                # Within partition edge
-                partition_id = self.v2p[j]
-                writer = csv.writer(file_objects[partition_id], delimiter=' ')
-                writer.writerow(line)
-            else:
-                # Cross-partition edge - store in both partitions
-                for partition_id in [self.v2p[i], self.v2p[j]]:
-                    writer = csv.writer(file_objects[partition_id], delimiter=' ')
-                    writer.writerow(line)
-        
-        self.file.close()
-        
-        for files in file_objects:
-            files.close()
-    
-    def partition_features(self):
-        """Partition the feature file."""
-        
-        node_feats = np.load(self.input_path + self.dataset +'/feats.npy', mmap_mode='r')
-        n_feats = node_feats.shape[1]
-        
-        with open(self.output_path + 'num_feats.txt', 'w') as f:
-            f.write(str(n_feats))
-        
-        for i in range(self.number_partition):
-            edge_list = np.loadtxt(self.output_path + 'partition_' + str(i) + '.txt', dtype=int)
-            node_set = np.unique(edge_list)
-            feat = node_feats[node_set]
-            np.save(self.output_path + 'partition_' + str(i) + '-feats.npy', feat)
-
-    def save_dgl_graph(self):
-        """Save the partitioned subgraphs as DGL graph objects."""
-        
-        for i in range(self.number_partition):
-            edge_list = pd.read_csv(self.output_path + 'partition_' + str(i) + '.txt', sep=' ', names=['src','dst'])
-            edge_list, node_mapping = pd_reindex_id(edge_list)
-
-            with open(self.output_path + 'partition_' + str(i) + '-mapping.json', 'wb') as json_file:
-                pickle.dump(node_mapping, json_file)
+            # Create subgraph
+            subgraph = dgl.node_subgraph(self.g, partition_nodes)
             
-            g_p = dgl.graph((torch.tensor(edge_list['src']), torch.tensor(edge_list['dst'])))
-            g_p = dgl.to_bidirected(g_p, copy_ndata=True)
-
-            feat = np.load(self.output_path + 'partition_' + str(i) + '-feats.npy')
-            g_p.ndata['feat'] = torch.from_numpy(feat).float()
-            save_graphs(self.output_path + 'partition_' + str(i) + '.bin', [g_p])
+            # Add features
+            subgraph.ndata['feat'] = self.features[partition_nodes]
+            subgraph.ndata['label'] = self.labels[partition_nodes]
+            
+            # Add masks
+            train_mask, val_mask, test_mask = self.masks
+            subgraph.ndata['train_mask'] = train_mask[partition_nodes]
+            subgraph.ndata['val_mask'] = val_mask[partition_nodes]
+            subgraph.ndata['test_mask'] = test_mask[partition_nodes]
+            
+            # Save subgraph
+            subgraph_path = os.path.join(self.output_path, f'partition_{partition_id}.bin')
+            save_graphs(subgraph_path, [subgraph])
+            
+            print(f"  Partition {partition_id}: {subgraph.num_nodes()} nodes, {subgraph.num_edges()} edges")
 
     def save_overhead_results(self, results):
         """Save overhead measurement results to file."""
         
-        results_file = self.output_path + 'overhead_analysis.json'
+        results_file = os.path.join(self.output_path, 'overhead_analysis.json')
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         
-        print(f"\nOverhead analysis results saved to: {results_file}")
+        # Also save a summary CSV for easy comparison
+        summary_file = os.path.join(self.output_path, 'overhead_summary.csv')
+        summary_data = {
+            'dataset': [results['dataset']],
+            'method': [results['partitioning_method']], 
+            'num_partitions': [results['number_partitions']],
+            'nodes': [results['original_nodes']],
+            'edges': [results['original_edges']],
+            'overhead_ratio': [results['overhead_ratio']],
+            'overhead_percent': [results['overhead_ratio'] * 100],
+            'cut_ratio': [results['cut_ratio']],
+            'replication_factor': [results['replication_factor']]
+        }
+        
+        df = pd.DataFrame(summary_data)
+        df.to_csv(summary_file, index=False)
+        
+        print(f"\nResults saved to:")
+        print(f"  Detailed: {results_file}")
+        print(f"  Summary: {summary_file}")
     
     def run(self):
         """Run the partitioning algorithm with overhead measurement."""
-        print("Step 1: Assigning partitions...")
+        print("="*60)
+        print(f"PARTITIONING OVERHEAD ANALYSIS")
+        print(f"Dataset: {self.dataset}")
+        print(f"Method: {self.method}")
+        print(f"Partitions: {self.number_partition}")
+        print("="*60)
+        
+        print("\nStep 1: Assigning partitions...")
         self.assign_partitions()
         
-        print("Step 2: Measuring partition overhead...")
+        print("\nStep 2: Measuring partition overhead...")
         overhead_results = self.measure_partition_overhead()
         
-        print("Step 3: Creating partition files...")
-        self.partition_file()
+        print("\nStep 3: Creating partitioned subgraphs...")
+        self.create_partitioned_subgraphs()
         
-        print("Step 4: Partitioning features...")
-        self.partition_features()
-        
-        print("Step 5: Saving DGL graphs...")
-        self.save_dgl_graph()
-        
-        print("Step 6: Saving overhead results...")
+        print("\nStep 4: Saving results...")
         self.save_overhead_results(overhead_results)
         
-        print('Partitioning completed with overhead measurement.')
+        print('\nPartitioning analysis completed!')
         return overhead_results
 
 
+def run_multiple_experiments():
+    """Run experiments on multiple datasets and partition counts."""
+    
+    datasets = ['reddit', 'flickr', 'yelp', 'cora', 'citeseer', 'pubmed']
+    partition_counts = [2, 4, 8, 16]
+    
+    all_results = []
+    
+    for dataset in datasets:
+        print(f"\n{'='*60}")
+        print(f"PROCESSING DATASET: {dataset.upper()}")
+        print(f"{'='*60}")
+        
+        for num_partitions in partition_counts:
+            try:
+                print(f"\n--- Testing {num_partitions} partitions ---")
+                
+                analyzer = MaxKGNNPartitioningOverhead(
+                    dataset=dataset,
+                    data_path="./data/",
+                    output_path=f"./partition_analysis/{dataset}_{num_partitions}partitions/",
+                    number_partition=num_partitions,
+                    method='METIS',
+                    selfloop=False
+                )
+                
+                results = analyzer.run()
+                all_results.append(results)
+                
+                print(f"Overhead for {dataset} with {num_partitions} partitions: {results['overhead_ratio']*100:.2f}%")
+                
+            except Exception as e:
+                print(f"Error processing {dataset} with {num_partitions} partitions: {e}")
+                continue
+    
+    # Save combined results
+    combined_file = "./partition_analysis/combined_overhead_results.json"
+    os.makedirs("./partition_analysis/", exist_ok=True)
+    with open(combined_file, 'w') as f:
+        json.dump(all_results, f, indent=2)
+    
+    # Create summary CSV
+    summary_df = pd.DataFrame(all_results)
+    summary_df.to_csv("./partition_analysis/combined_summary.csv", index=False)
+    
+    print(f"\n{'='*60}")
+    print("EXPERIMENT SUMMARY")
+    print(f"{'='*60}")
+    print(f"Results saved to: {combined_file}")
+    print("\nOverhead by dataset and partition count:")
+    
+    for dataset in datasets:
+        dataset_results = [r for r in all_results if r['dataset'] == dataset]
+        if dataset_results:
+            print(f"\n{dataset}:")
+            for result in sorted(dataset_results, key=lambda x: x['number_partitions']):
+                print(f"  {result['number_partitions']} partitions: {result['overhead_ratio']*100:.2f}%")
+
+
 if __name__ == "__main__":
-    print('====='*10)
-    path = os.path.abspath(os.path.join(os.getcwd(),'..'))
+    parser = argparse.ArgumentParser(description='MaxK-GNN Graph Partitioning Overhead Analysis')
+    parser.add_argument('--dataset', type=str, default='reddit', 
+                       choices=['reddit', 'flickr', 'yelp', 'cora', 'citeseer', 'pubmed', 
+                               'ogbn-arxiv', 'ogbn-products', 'ogbn-proteins'],
+                       help='Dataset name')
+    parser.add_argument('--data_path', type=str, default='./data/', 
+                       help='Path to store/load datasets')
+    parser.add_argument('--number_partition', type=int, default=4, 
+                       help='Number of partitions')
+    parser.add_argument('--method', type=str, default='METIS', 
+                       choices=['METIS', 'Random'],
+                       help='Partitioning method')
+    parser.add_argument('--selfloop', action='store_true', 
+                       help='Add self-loops to the graph')
+    parser.add_argument('--run_all', action='store_true',
+                       help='Run experiments on all datasets with multiple partition counts')
     
-    parser = argparse.ArgumentParser(description='Graph Partitioning with Memory Overhead Measurement')
-    parser.add_argument('--dataset', type=str, default='cora')
-    parser.add_argument('--number_partition', type=int, default=4)
-    parser.add_argument('--method', type=str, default='METIS')
     args = parser.parse_args()
-    print(args)
     
-    dataset = args.dataset
-    number_partition = args.number_partition
-    method = args.method
-    
-    partitioner = PartitioningWithOverheadMeasurement(
-        dataset=dataset, 
-        method=method,
-        number_partition=number_partition,
-        input_path=path + '/datasets/',
-        output_path=path + '/output/' + 'partitions-' + str(number_partition) + '/' + dataset + '/' + method + '/'
-    )
-    
-    overhead_results = partitioner.run()
-    
-    print(f"\n=== FINAL SUMMARY ===")
-    print(f"Dataset: {dataset}")
-    print(f"Partitioning method: {method}")
-    print(f"Number of partitions: {number_partition}")
-    print(f"Memory overhead ratio: {overhead_results['overhead_ratio']:.4f} ({overhead_results['overhead_ratio']*100:.2f}%)")
-    print(f"This means partitioned data uses {overhead_results['overhead_ratio']*100:.2f}% more memory than original data")
+    if args.run_all:
+        run_multiple_experiments()
+    else:
+        analyzer = MaxKGNNPartitioningOverhead(
+            dataset=args.dataset,
+            data_path=args.data_path,
+            output_path=f"./partition_analysis/{args.dataset}_{args.number_partition}partitions/",
+            number_partition=args.number_partition,
+            method=args.method,
+            selfloop=args.selfloop
+        )
+        
+        results = analyzer.run()
+        
+        print(f"\n{'='*60}")
+        print("FINAL SUMMARY")
+        print(f"{'='*60}")
+        print(f"Dataset: {args.dataset}")
+        print(f"Partitioning method: {args.method}")
+        print(f"Number of partitions: {args.number_partition}")
+        print(f"Memory overhead ratio: {results['overhead_ratio']:.4f} ({results['overhead_ratio']*100:.2f}%)")
+        print(f"Cut ratio: {results['cut_ratio']:.4f} ({results['cut_ratio']*100:.2f}%)")
+        print(f"Edge replication factor: {results['replication_factor']:.4f}")
+        print(f"\nThis means partitioned data uses {results['overhead_ratio']*100:.2f}% more memory than original data")
