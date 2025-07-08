@@ -49,7 +49,7 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
             raise ValueError(f"Unknown dataset: {dataset_name}")
         
         g = data[0]
-        g = g.int()
+        g = g.long()  # Use int64 instead of int32
         features = g.ndata["feat"]
         if dataset_name == 'yelp':
             labels = g.ndata["label"].float()
@@ -77,7 +77,7 @@ def load_maxkgnn_dataset(dataset_name, data_path="./data/", selfloop=False):
         
         g, labels = data[0]
         labels = torch.squeeze(labels, dim=1)
-        g = g.int()
+        g = g.long()  # Use int64 instead of int32
         features = g.ndata["feat"]
         
         # Convert split indices to masks
@@ -127,9 +127,11 @@ class MaxKGNNPartitioningOverhead():
             dataset, data_path, selfloop
         )
         
-        # Add self-loop if specified
+        # Add self-loop if specified (ensure int64 compatibility)
         if selfloop:
             self.g = dgl.add_self_loop(self.g)
+            # Ensure the graph remains int64 after adding self-loops
+            self.g = self.g.long()
         
         self.number_edges = self.g.num_edges()
         self.number_nodes = self.g.num_nodes()
@@ -143,6 +145,7 @@ class MaxKGNNPartitioningOverhead():
         print(f"Dataset loaded: {self.number_nodes} nodes, {self.number_edges} edges")
         print(f"Features shape: {self.features.shape}")
         print(f"Number of classes: {self.num_classes}")
+        print(f"Graph dtype: {self.g.idtype}")  # Debug info
     
     def _set_seed(self):
         """Creating the initial random seed."""
@@ -152,6 +155,12 @@ class MaxKGNNPartitioningOverhead():
 
     def assign_partitions(self):
         """Partition a graph using METIS or other methods."""
+        
+        # Ensure graph is int64 for METIS
+        if self.g.idtype != torch.int64:
+            print("Converting graph to int64 for METIS compatibility...")
+            self.g = self.g.long()
+        
         if self.method == 'METIS':
             partitions = dgl.metis_partition_assignment(self.g, 
                                                         self.number_partition, 
@@ -171,7 +180,7 @@ class MaxKGNNPartitioningOverhead():
         with open(os.path.join(self.output_path, 'partition_assignment.json'), 'w') as f:
             json.dump(self.v2p, f, indent=2)
         
-        print(f"Partitioned {self.number_nodes} nodes into {self.number_partition} partitions")
+        print(f"Partitioned {self.number_nodes} nodes into {self.number_partition} partitions using {self.method}")
         
         # Print partition balance
         partition_sizes = [0] * self.number_partition
