@@ -32,15 +32,14 @@ def load_reddit_dataset(data_path="./data/"):
     return g
 
 
-def partition_subgraph_worker(args):
-    """Worker function to partition a subgraph in parallel."""
-    subgraph_nodes, original_graph_edges, target_partitions, worker_id = args
+def partition_subgraph_sequential(subgraph_nodes, original_graph, target_partitions, worker_id):
+    """Partition a subgraph sequentially (simulating what one worker would do)."""
     
     print(f"  Worker {worker_id}: Creating subgraph with {len(subgraph_nodes):,} nodes...")
     
     # Create subgraph from node list
     subgraph_nodes_tensor = torch.tensor(subgraph_nodes, dtype=torch.long)
-    subgraph = dgl.node_subgraph(original_graph_edges, subgraph_nodes_tensor)
+    subgraph = dgl.node_subgraph(original_graph, subgraph_nodes_tensor)
     
     # Ensure int64 for METIS
     if subgraph.idtype != torch.int64:
@@ -70,7 +69,7 @@ def partition_subgraph_worker(args):
         final_partition_id = worker_id * target_partitions + partition_id
         partition_assignment[int(original_node_id)] = int(final_partition_id)
     
-    return partition_assignment, partition_time, subgraph.num_edges()
+    return partition_assignment, partition_time
 
 
 def calculate_partition_quality(graph, partition_assignment, num_partitions):
@@ -163,32 +162,33 @@ def scenario_a_hierarchical_partitioning(graph, target_partitions=4):
     print(f"  Partition 0: {len(partition_0_nodes):,} nodes")
     print(f"  Partition 1: {len(partition_1_nodes):,} nodes")
     
-    # Step 2: Parallel partitioning of each part into 2 sub-parts
-    print(f"\nStep 2: Parallel partitioning (each part → 2 sub-parts)...")
+    # Step 2: Sequential partitioning simulating parallel execution
+    print(f"\nStep 2: Sequential partitioning (simulating parallel execution)...")
     step2_start = time.time()
     
-    # Prepare arguments for parallel execution
-    partition_args = [
-        (partition_0_nodes, graph, 2, 0),  # Worker 0: partition partition_0 into 2 parts
-        (partition_1_nodes, graph, 2, 1),  # Worker 1: partition partition_1 into 2 parts
-    ]
-    
-    # Execute in parallel
+    # Run each subgraph partitioning sequentially but time them separately
     all_assignments = {}
-    total_subgraph_edges = 0
-    parallel_times = []
+    partition_times = []
     
-    with ProcessPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(partition_subgraph_worker, args) for args in partition_args]
-        
-        for future in as_completed(futures):
-            assignment, partition_time, subgraph_edges = future.result()
-            all_assignments.update(assignment)
-            parallel_times.append(partition_time)
-            total_subgraph_edges += subgraph_edges
+    # Partition first subgraph (simulating worker 0)
+    assignment_0, time_0 = partition_subgraph_sequential(partition_0_nodes, graph, 2, 0)
+    all_assignments.update(assignment_0)
+    partition_times.append(time_0)
     
-    step2_time = max(parallel_times)  # Parallel time is the max of all workers
-    print(f"Step 2 completed in {step2_time:.2f}s (parallel execution)")
+    # Partition second subgraph (simulating worker 1)  
+    assignment_1, time_1 = partition_subgraph_sequential(partition_1_nodes, graph, 2, 1)
+    all_assignments.update(assignment_1)
+    partition_times.append(time_1)
+    
+    # Simulated parallel time is the maximum of the two times
+    step2_time = max(partition_times)
+    actual_sequential_time = sum(partition_times)
+    
+    print(f"Step 2 completed:")
+    print(f"  Worker 0 time: {partition_times[0]:.2f}s")
+    print(f"  Worker 1 time: {partition_times[1]:.2f}s") 
+    print(f"  Simulated parallel time: {step2_time:.2f}s (max of both)")
+    print(f"  Actual sequential time: {actual_sequential_time:.2f}s (sum of both)")
     
     total_time = time.time() - total_start_time
     
@@ -196,7 +196,11 @@ def scenario_a_hierarchical_partitioning(graph, target_partitions=4):
     quality = calculate_partition_quality(graph, all_assignments, target_partitions)
     
     print(f"\nScenario A Results:")
-    print(f"  Total time: {total_time:.2f}s (Step 1: {step1_time:.2f}s + Step 2: {step2_time:.2f}s)")
+    print(f"  Step 1 time (sequential): {step1_time:.2f}s")
+    print(f"  Step 2 time (simulated parallel): {step2_time:.2f}s") 
+    print(f"  Step 2 time (actual sequential): {actual_sequential_time:.2f}s")
+    print(f"  Total time (with parallel): {total_time:.2f}s")
+    print(f"  Total time (purely sequential): {step1_time + actual_sequential_time:.2f}s")
     print(f"  Cut edges: {quality['cut_edges']:,}")
     print(f"  Cut ratio: {quality['cut_ratio']:.4f} ({quality['cut_ratio']*100:.2f}%)")
     print(f"  Balance ratio: {quality['balance_ratio']:.4f}")
@@ -207,6 +211,7 @@ def scenario_a_hierarchical_partitioning(graph, target_partitions=4):
         'total_time': total_time,
         'step1_time': step1_time,
         'step2_time': step2_time,
+        'actual_sequential_time': actual_sequential_time,
         'partition_assignment': all_assignments,
         'quality': quality
     }
@@ -268,18 +273,31 @@ def compare_scenarios(results_a, results_b):
     print("COMPARISON: HIERARCHICAL vs DIRECT PARTITIONING")
     print("="*80)
     
-    # Time comparison
-    time_a = results_a['total_time']
+    # Time comparison with both simulated parallel and actual sequential
+    time_a_parallel = results_a['total_time']
+    time_a_sequential = results_a['step1_time'] + results_a['actual_sequential_time']
     time_b = results_b['total_time']
-    time_speedup = time_b / time_a if time_a > 0 else float('inf')
+    
+    speedup_parallel = time_b / time_a_parallel if time_a_parallel > 0 else float('inf')
+    speedup_sequential = time_b / time_a_sequential if time_a_sequential > 0 else float('inf')
     
     print(f"\n📊 TIME COMPARISON:")
-    print(f"  Scenario A (Hierarchical): {time_a:.2f}s")
-    print(f"  Scenario B (Direct):       {time_b:.2f}s")
-    if time_speedup > 1:
-        print(f"  ⚡ Scenario A is {time_speedup:.2f}x FASTER than Scenario B")
+    print(f"  Scenario A (Hierarchical - Simulated Parallel): {time_a_parallel:.2f}s")
+    print(f"  Scenario A (Hierarchical - Actual Sequential):  {time_a_sequential:.2f}s")
+    print(f"  Scenario B (Direct):                            {time_b:.2f}s")
+    
+    print(f"\n  Speedup Analysis:")
+    if speedup_parallel > 1:
+        print(f"  ⚡ Scenario A (parallel) is {speedup_parallel:.2f}x FASTER than Scenario B")
     else:
-        print(f"  ⚡ Scenario B is {1/time_speedup:.2f}x FASTER than Scenario A")
+        print(f"  ⚡ Scenario B is {1/speedup_parallel:.2f}x FASTER than Scenario A (parallel)")
+        
+    if speedup_sequential > 1:
+        print(f"  📊 Scenario A (sequential) is {speedup_sequential:.2f}x FASTER than Scenario B")
+    else:
+        print(f"  📊 Scenario B is {1/speedup_sequential:.2f}x FASTER than Scenario A (sequential)")
+    
+    print(f"  🎯 Parallel efficiency: {speedup_sequential/speedup_parallel:.2f}x improvement from parallelization")
     
     # Quality comparison  
     cut_a = results_a['quality']['cut_edges']
@@ -320,9 +338,11 @@ def compare_scenarios(results_a, results_b):
         print(f"  🤝 RESULT: Close call - depends on priority (speed vs quality)")
     
     return {
-        'time_speedup_a_vs_b': time_speedup,
+        'time_speedup_parallel': speedup_parallel,
+        'time_speedup_sequential': speedup_sequential,
         'cut_improvement_b_vs_a_percent': cut_improvement,
-        'balance_difference': balance_b - balance_a
+        'balance_difference': balance_b - balance_a,
+        'parallel_efficiency': speedup_sequential/speedup_parallel if speedup_parallel > 0 else 1.0
     }
 
 
@@ -336,6 +356,7 @@ def save_results(results_a, results_b, comparison, output_file="partition_compar
             'total_time': results_a['total_time'],
             'step1_time': results_a.get('step1_time', 0),
             'step2_time': results_a.get('step2_time', 0),
+            'actual_sequential_time': results_a.get('actual_sequential_time', 0),
             'quality': results_a['quality']
         },
         'scenario_b': {
